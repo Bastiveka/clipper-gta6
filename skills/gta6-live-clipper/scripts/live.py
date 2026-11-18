@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """GTA 6 LIVE Clipper: clips a stream WHILE it's live.
 
-  start URL [URL...]   start recording each live stream into a rolling local buffer (background)
+  discover            find GTA 6 livestreams on YouTube (and Twitch when .env is set). No link needed.
+  start [URL...]      record each live stream. With no URL, find livestreams and start the biggest.
   next RUN [RUN...]    wait for the next 5-minute transcript window (from any of the runs) and print it
   clip RUN [RUN...]    render every new pick straight from the local buffer (no re-download)
   status RUN [RUN...]  what each recorder is doing
   stop RUN [RUN...]    stop recording (buffer is cleaned up; clips stay)
 
 The recorder (hidden `_daemon` command) keeps 1-minute video segments for --buffer-min minutes,
-transcribes each one on this Mac as it lands, tracks loudness and (Twitch) chat speed, and writes
+transcribes each one on this computer as it lands, tracks loudness and (Twitch) chat speed, and writes
 windows/window_NNN.md every --window-min minutes. Claude reads each window and writes
 picks/window_NNN.json (same format as the VOD clipper). Shares the gta6-clipper engine + venv.
 """
@@ -68,14 +69,14 @@ class Daemon:
         q = self.cfg.get("quality", 720)
         cmd = g.YTDLP + g.cookie_args(self.cfg.get("cookies")) + [
             "-f", f"best[height<={q}]/bv*[height<={q}]+ba/best", "-o", "-", self.cfg["url"]]
-        ff = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", "pipe:0", "-map", "0:v:0", "-map", "0:a:0",
+        ff = [g.which_tool("ffmpeg"), "-hide_banner", "-loglevel", "error", "-i", "pipe:0", "-map", "0:v:0", "-map", "0:a:0",
               "-c", "copy", "-f", "segment", "-segment_time", str(SEG), "-reset_timestamps", "1",
               "-segment_list", str(self.rd / "segs.csv"), "-segment_list_type", "csv",
               str(self.seg_dir / "seg_%05d.ts")]
         self.t0_wall = time.time()
         self.save_state(recording=True, started_wall=self.t0_wall)
-        yt = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=open(self.rd / "ytdlp.log", "ab"))
-        ffp = subprocess.Popen(ff, stdin=yt.stdout, stderr=open(self.rd / "ffmpeg.log", "ab"))
+        yt = g.popen(cmd, stdout=subprocess.PIPE, stderr=open(self.rd / "ytdlp.log", "ab"))
+        ffp = g.popen(ff, stdin=yt.stdout, stderr=open(self.rd / "ffmpeg.log", "ab"))
         yt.stdout.close()
         self.procs = [yt, ffp]
         ffp.wait()
@@ -127,7 +128,7 @@ class Daemon:
         if p.exists():
             for r in csv.reader(p.read_text().splitlines()):
                 if len(r) >= 3:
-                    rows.append((r[0], float(r[1]), float(r[2])))
+                    rows.append((Path(r[0]).name, float(r[1]), float(r[2])))
         # ffmpeg writes cumulative times; normalise to stream time from the first segment
         if rows:
             base = rows[0][1]
@@ -137,12 +138,12 @@ class Daemon:
     def process_segment(self, fname, st, en):
         f = self.seg_dir / fname
         wav = self.rd / "seg.wav"
-        g.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(f), "-vn", "-ac", "1", "-ar", "16000", str(wav)])
+        g.run([g.which_tool("ffmpeg"), "-y", "-loglevel", "error", "-i", str(f), "-vn", "-ac", "1", "-ar", "16000", str(wav)])
         try:
             segs = g.transcribe(wav, self.rd / "seg_whisper")
         except Exception:
             segs = []
-        r = g.run(["ffmpeg", "-hide_banner", "-nostats", "-i", str(wav), "-af",
+        r = g.run([g.which_tool("ffmpeg"), "-hide_banner", "-nostats", "-i", str(wav), "-af",
                    "asetnsamples=n=16000,astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.RMS_level:file=-",
                    "-f", "null", "-"])
         import re
@@ -206,6 +207,8 @@ class Daemon:
         threading.Thread(target=self.record, daemon=True).start()
         threading.Thread(target=self.chat, daemon=True).start()
         signal.signal(signal.SIGTERM, lambda *_: self.shutdown())
+        if os.name == "nt" and hasattr(signal, "SIGBREAK"):
+            signal.signal(signal.SIGBREAK, lambda *_: self.shutdown())
         time.sleep(5)
         while True:
             rows = self.segments()
@@ -230,7 +233,8 @@ class Daemon:
                     return
             time.sleep(5)
 
-    def shutdown(self):
+    def shutdown(self, *_):
+        self.stop = True
         for p in getattr(self, "procs", []):
             try:
                 p.terminate()
@@ -239,9 +243,32 @@ class Daemon:
 
 
 # ================================================================ CLI
+def cmd_discover(a):
+    log("Finding GTA 6 livestreams. No link needed...")
+    found = g.discover_streams(limit=a.limit, live_only=True, include_videos=False)
+    if not found:
+        log("No GTA 6 livestreams found right now. Try again in a few minutes.")
+        return
+    g._emit_discover(found)
+
+
 def cmd_start(a):
     RUNS.mkdir(parents=True, exist_ok=True)
-    for url in a.urls:
+    urls = list(a.urls)
+    if not urls:
+        log("No link given. Looking for GTA 6 livestreams...")
+        found = g.discover_streams(limit=max(1, a.limit), live_only=True, include_videos=False)
+        urls = [s.get("live_url") or s["url"] for s in found]
+        if not urls:
+            log("No GTA 6 livestreams found right now. Try again in a few minutes.")
+            return
+        for s in found:
+            who = s.get("streamer") or "unknown"
+            log(f"  live: [{s['platform']}] {who} ({s.get('viewers', 0):,} watching) {s['title'][:80]}")
+            log(f"        {s.get('live_url') or s['url']}")
+        urls = urls[: max(1, a.limit)]
+        log(f"Starting {len(urls)} livestream(s).")
+    for url in urls:
         try:
             meta = g.ytdlp_json(url, a.cookies, ["--no-playlist"])
         except Exception as e:
@@ -252,13 +279,14 @@ def cmd_start(a):
             continue
         streamer = meta.get("uploader") or meta.get("channel") or "streamer"
         rd = RUNS / f"{time.strftime('%Y-%m-%d-%H%M')}-{g.slug(streamer, 24)}"
+        if rd.exists():
+            rd = RUNS / f"{time.strftime('%Y-%m-%d-%H%M%S')}-{g.slug(streamer, 24)}"
         rd.mkdir(parents=True, exist_ok=True)
         jsave(rd / "stream.json", {"url": url, "webpage_url": meta.get("webpage_url") or url, "streamer": streamer,
                                    "title": meta.get("title"), "cookies": a.cookies, "quality": a.quality,
                                    "buffer_min": a.buffer_min, "window_min": a.window_min})
         jsave(rd / "state.json", {"windows": 0})
-        p = subprocess.Popen([sys.executable, __file__, "_daemon", str(rd)], start_new_session=True,
-                             stdout=open(rd / "daemon.log", "ab"), stderr=subprocess.STDOUT)
+        p = g.spawn_background([sys.executable, __file__, "_daemon", str(rd)], open(rd / "daemon.log", "ab"))
         (rd / "pid").write_text(str(p.pid))
         log(f"RECORDING {streamer}: {meta.get('title')}\n  run: {rd}")
 
@@ -318,9 +346,9 @@ def cmd_clip(a):
             work = rd / f"work_{n:02d}"
             work.mkdir(exist_ok=True)
             lst = work / "segs.txt"
-            lst.write_text("".join(f"file '{(rd / 'buffer' / f).resolve()}'\n" for _, _, f in need))
+            lst.write_text("".join(g.ffmpeg_concat_line(rd / "buffer" / f) + "\n" for _, _, f in need))
             src = work / "src.ts"
-            g.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", str(lst), "-c", "copy", str(src)])
+            g.run([g.which_tool("ffmpeg"), "-y", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", str(lst), "-c", "copy", str(src)])
             try:
                 out, mode = g.render_one(rd, info, c, n, None, a.keep, local_src=src, src_start=need[0][0])
                 rendered.append({k: v for k, v in c.items()} | {"file": str(out), "layout": mode})
@@ -340,8 +368,7 @@ def cmd_status(a):
         rendered = [x for x in jload(rd / "rendered.json", []) if not x.get("skipped")]
         alive = False
         try:
-            os.kill(int((rd / "pid").read_text()), 0)
-            alive = True
+            alive = g.pid_alive((rd / "pid").read_text())
         except Exception:
             pass
         log(json.dumps({"run": str(rd), "streamer": info.get("streamer"), "recorder_running": alive,
@@ -354,20 +381,27 @@ def cmd_stop(a):
     for r in a.runs:
         rd = Path(r)
         try:
-            os.killpg(int((rd / "pid").read_text()), signal.SIGTERM)
-            log(f"stopping {rd.name} (last window is written once the recorder closes)")
+            pid = int((rd / "pid").read_text())
         except Exception as e:
             log(f"{rd.name}: not running ({e})")
+            continue
+        if not g.pid_alive(pid):
+            log(f"{rd.name}: not running")
+            continue
+        g.stop_process(pid)
+        log(f"stopping {rd.name} (last window is written once the recorder closes)")
 
 
 def main():
     if not (VOD / ".ready").exists():
-        sys.exit(f"Set up the GTA 6 clipper first: bash '{VOD}/scripts/setup.sh'")
+        sys.exit("Set up the GTA 6 clipper first. " + g.setup_hint())
     p = argparse.ArgumentParser()
     sp = p.add_subparsers(dest="cmd", required=True)
-    s = sp.add_parser("start"); s.add_argument("urls", nargs="+"); s.add_argument("--cookies")
+    s = sp.add_parser("start"); s.add_argument("urls", nargs="*"); s.add_argument("--cookies")
     s.add_argument("--quality", type=int, default=720); s.add_argument("--buffer-min", type=int, default=15)
     s.add_argument("--window-min", type=int, default=5)
+    s.add_argument("--limit", type=int, default=1, help="with no URL, start this many discovered livestreams")
+    disc = sp.add_parser("discover"); disc.add_argument("--limit", type=int, default=5)
     n = sp.add_parser("next"); n.add_argument("runs", nargs="+"); n.add_argument("--wait", type=int, default=540)
     c = sp.add_parser("clip"); c.add_argument("runs", nargs="+"); c.add_argument("--min-score", type=float, default=7.5)
     c.add_argument("--keep", action="store_true")
@@ -378,7 +412,8 @@ def main():
     if a.cmd == "_daemon":
         Daemon(Path(a.run)).run()
         return
-    {"start": cmd_start, "next": cmd_next, "clip": cmd_clip, "status": cmd_status, "stop": cmd_stop}[a.cmd](a)
+    {"start": cmd_start, "discover": cmd_discover, "next": cmd_next, "clip": cmd_clip,
+     "status": cmd_status, "stop": cmd_stop}[a.cmd](a)
 
 
 if __name__ == "__main__":

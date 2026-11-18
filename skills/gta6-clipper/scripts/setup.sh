@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# GTA 6 Clipper setup: checks what this Mac needs, installs what's missing, says when it's ready.
+# GTA 6 Clipper setup for Mac. On Windows this hands off to setup.ps1.
+# Checks what this Mac needs, installs what's missing, says when it's ready.
 # Safe to re-run any time.
 set -uo pipefail
 
@@ -13,7 +14,21 @@ fail() { printf "  [MISSING] %s\n" "$1"; FAILED=1; }
 FAILED=0
 
 echo "GTA 6 Clipper setup"
-if [[ "$(uname)" != "Darwin" ]]; then echo "Mac only for now."; exit 1; fi
+case "$(uname -s 2>/dev/null || echo unknown)" in
+  Darwin) ;;
+  MINGW*|MSYS*|CYGWIN*)
+    if command -v powershell.exe >/dev/null 2>&1; then
+      exec powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$SKILL_DIR/scripts/setup.ps1"
+    fi
+    echo "On Windows run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/setup.ps1"
+    exit 1
+    ;;
+  *)
+    echo "On Windows run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/setup.ps1"
+    echo "This script sets up a Mac."
+    exit 1
+    ;;
+esac
 
 # 1. Homebrew
 if command -v brew >/dev/null 2>&1; then ok "Homebrew"; else

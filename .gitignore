@@ -1,5 +1,6 @@
 .venv/
 models/
+bin/
 runs/
 .env
 .ready

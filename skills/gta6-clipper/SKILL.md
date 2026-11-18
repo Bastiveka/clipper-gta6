@@ -1,85 +1,83 @@
 ---
 name: gta6-clipper
-description: GTA 6 Clipper. Turns GTA 6 streams into ready-to-post vertical clips (facecam on top, gameplay below, hook title, word-by-word captions, post caption + hashtags). Activates on "set up the GTA 6 clipper", "clip this stream <link>", "find me today's biggest GTA 6 streams and clip them", /gta6-clipper, /clip, or any request to clip a YouTube, Twitch or Kick stream. Downloads audio only, transcribes on the Mac, marks loud moments and chat spikes, the Claude session itself reads the transcript 12 minutes at a time and scores moments (no API keys), then downloads only the needed minutes and renders 3 clips per stream. Works on a Claude subscription or free via Ollama (ollama launch claude). Mac only.
+description: GTA 6 Clipper. Turns GTA 6 YouTube videos and streams into ready-to-post vertical clips (facecam on top, gameplay below, hook title, word-by-word captions, post caption + hashtags). Activates on "set up the GTA 6 clipper", "clip this stream <link>", "clip today's GTA 6 videos", "find GTA 6 on YouTube", "find livestreams", /gta6-clipper, /clip, or any request to clip a YouTube, Twitch or Kick video. If the user does not paste a link, search YouTube and clip what comes back. Do not ask for a link. Downloads audio only, transcribes on this computer, marks loud moments and chat spikes, the Claude session itself reads the transcript 12 minutes at a time and scores moments (no API keys), then downloads only the needed minutes and renders 3 clips per video. Works on a Claude subscription or free via Ollama (ollama launch claude). Mac and Windows.
 ---
 
 # GTA 6 Clipper
 
-Stream link (YouTube, Twitch, Kick) or nothing -> 3 ready-to-post 1080x1920 clips per stream.
-Everything except the picking runs on this Mac. The picking is done by YOU (this Claude Code session),
+A YouTube, Twitch or Kick link, or no link at all -> 3 ready-to-post 1080x1920 clips per video.
+Everything except the picking runs on this computer. The picking is done by YOU (this Claude Code session),
 so it runs on the user's Claude subscription, or on a local model through Ollama. No API keys.
+YouTube search does not need an API key. Do not ask the user for one.
 
-`S` = this skill's folder. Always run Python through the skill's venv:
-`"$S/.venv/bin/python" "$S/scripts/gta6clip.py" ...`. Quote paths (they may contain spaces).
+`S` = this skill's folder. Run the launcher, not a hard-coded python path:
+
+- Mac, Linux, or Git Bash: `bash "$S/scripts/gta6.sh" <command>`
+- Windows PowerShell: `powershell -NoProfile -ExecutionPolicy Bypass -File "$S\scripts\gta6.ps1" <command>`
+
+Quote paths (they may contain spaces). On Windows do not use `.venv/bin/python`. That path is Mac-only.
+The Windows venv is `.venv\Scripts\python.exe`, and the launcher already uses it.
+
+## No link needed
+
+If the user did not paste a URL, do not ask for one.
+
+- "clip today's GTA 6 videos", "find YouTube videos", "clip GTA 6": run `discover` (add `--limit N` when they asked for a number). Then `prep` every URL under **PREP THESE**.
+- "what's live" or "only livestreams": run `discover --live` and hand **LIVE THESE** to the gta6-live-clipper skill. Do not prep a YouTube URL that is still live.
+- Prep the finished streams and YouTube videos without waiting for approval, unless the user asked to choose.
+
+A link they did paste still works: `prep <url>`.
 
 ## 0. "Set up the GTA 6 clipper"
 
-Run `bash "$S/scripts/setup.sh"`. It checks Homebrew, ffmpeg, whisper-cpp, deno, uv, the Python venv
-(yt-dlp, OpenCV, Pillow), the Whisper model and the face detector, installs what's missing and prints
-READY or what is still missing. Tell the user in plain words what was installed and that it's ready.
-If any command later says "Not set up yet", run setup first. Re-run setup if YouTube downloads start
-failing (it updates yt-dlp).
+- Mac: `bash "$S/scripts/setup.sh"`
+- Windows: `powershell -NoProfile -ExecutionPolicy Bypass -File "$S\scripts\setup.ps1"`
 
-## 1+2. Get the streams ready ("prep")
+It checks FFmpeg, whisper.cpp, Deno, uv, the Python venv (yt-dlp, OpenCV, Pillow), the Whisper model and the face detector, installs what's missing and prints READY or what is still missing. Tell the user in plain words what was installed and that it's ready. On Windows, tell them to restart Claude Code so new tools are on PATH.
+If any command later says "Not set up yet", run setup first. Re-run setup if YouTube downloads start failing (it updates yt-dlp).
+
+## 1+2. Get the videos ready ("prep")
 
 - Given links: `prep <url> [<url> ...]`
-- Given nothing ("find today's biggest GTA 6 streams"): run `discover` (default 7 streams, `--limit N`),
-  show the list, then `prep` all of the URLs it printed. Don't wait for approval unless the user asked to choose.
-- Age-restricted YouTube streams (common with GTA) and Kick need the browser login: add `--cookies chrome`
-  (or safari/firefox). If a download fails with "Sign in to confirm your age" / 403, retry with it.
-- `--jobs 2` (default) preps 2 streams at once. Don't go higher on a 16 GB Mac.
-- Long streams take a while (4 h stream: a few min download + ~8-12 min transcript). Run prep in the
-  background for 2+ streams and tell the user it's running.
+- Given nothing: `discover`, then `prep` the **PREP THESE** URLs. `discover --streams-only` skips regular YouTube videos and keeps livestreams plus long streams.
+- Age-restricted YouTube videos (common with GTA) and Kick need the browser login: add `--cookies chrome` (or `edge`, `firefox`, `brave`). Safari is Mac only. On Windows, close that browser first. If a download fails with "Sign in to confirm your age" / 403, retry with cookies.
+- `--jobs 2` (default) preps 2 videos at once. Don't go higher on a 16 GB computer.
+- Long videos take a while (4 h stream: a few min download + ~8-12 min transcript). Run prep in the background for 2+ videos and tell the user it's running.
 
-Prep downloads only the audio, transcribes it locally, marks where the streamer got loud and (YouTube
-replays) where chat sped up, and writes `chunks/chunk_NN.md`: 12-minute pieces with `<<LOUD(+12dB)>>` and
-`<<CHAT x4.1>>` markers. It prints the run folder for each stream.
+Prep downloads only the audio, transcribes it locally, marks where the streamer got loud and (YouTube replays) where chat sped up, and writes `chunks/chunk_NN.md`: 12-minute pieces with `<<LOUD(+12dB)>>` and `<<CHAT x4.1>>` markers. It prints the run folder for each video.
+
+YouTube videos under about 8 minutes and Shorts are skipped by discover. Finished streams are anything about 20 minutes or longer, or a shorter video whose title says it is a stream.
 
 ## 3. Pick the moments (you do this)
 
 Read `references/picking.md` first, every time. Then for each run folder:
 
 1. Read every `chunks/chunk_NN.md`, one at a time, in order.
-2. For each chunk write `picks/chunk_NN.json` (same NN): a JSON array of candidate moments, `[]` if
-   nothing qualifies. Write the file even when it's empty: that's how progress is tracked.
+2. For each chunk write `picks/chunk_NN.json` (same NN): a JSON array of candidate moments, `[]` if nothing qualifies. Write the file even when it's empty: that's how progress is tracked.
 3. `status <run>` shows which chunks still have no picks file. Keep going until `chunks_left` is empty.
 
-Multiple streams: give each stream its own subagent (Agent tool, general-purpose) with the run folder path
-and the instruction "read references/picking.md, then do step 3 of SKILL.md for this run folder". Up to 4 at
-once. If you're running on a local Ollama model, skip subagents and do the streams one after another.
+Multiple videos: give each one its own subagent (Agent tool, general-purpose) with the run folder path and the instruction "read references/picking.md, then do step 3 of SKILL.md for this run folder". Up to 4 at once. If you're running on a local Ollama model, skip subagents and do them one after another.
 
 ## 4. Make the clips
 
-`render <run>` (defaults: `--top 3 --min-score 7`). It ranks all picks, drops overlaps, snaps to sentence
-edges, downloads only those minutes, finds the facecam, stacks facecam on top of gameplay (or blurred
-full-frame if there's no facecam), burns in the hook title + word-by-word captions, normalises audio and
-writes `clips/clip_NN_<title>.mp4` + `clip_NN_<title>.txt` (title, post caption, hashtags) + `summary.json`.
+`render <run>` (defaults: `--top 3 --min-score 7`). It ranks all picks, drops overlaps, snaps to sentence edges, downloads only those minutes, finds the facecam, stacks facecam on top of gameplay (or blurred full-frame if there's no facecam), burns in the hook title + word-by-word captions, normalises audio and writes `clips/clip_NN_<title>.mp4` + `clip_NN_<title>.txt` (title, post caption, hashtags) + `summary.json`.
 
-- If fewer than 3 clips came out because scores were low, say so; offer `--min-score 6` rather than
-  quietly lowering the bar.
-- Pass the same `--cookies` as prep if the stream needed it (it's remembered in stream.json).
-- Render streams one after another (each uses ffmpeg + whisper on a short piece; fast).
+- If fewer than 3 clips came out because scores were low, say so; offer `--min-score 6` rather than quietly lowering the bar.
+- Pass the same `--cookies` as prep if the video needed it (it's remembered in stream.json).
+- Render videos one after another (each uses ffmpeg + whisper on a short piece; fast).
 
 ## 5. Report
 
-Per stream: stream length -> moments found -> clips kept, total time, and each clip's title, timestamp,
-length, layout (facecam / cam / gameplay) and file path. Open the clips folder with `open "<run>/clips"`.
+Per video: length -> moments found -> clips kept, total time, and each clip's title, timestamp, length, layout (facecam / cam / gameplay) and file path. Show the folder with `open "<run>"` (the launcher command). It opens Finder on Mac and File Explorer on Windows.
 Remind the user: watch every clip before posting, and only clip streamers who are fine with clipping.
 
 ## Other requests
 
-- "Make clip 2 longer / start earlier / different hook": edit that entry in the matching `picks/*.json`
-  (times or hook), delete the old mp4, re-run render (it re-picks deterministically, so the same top
-  picks come back with the change).
+- "Make clip 2 longer / start earlier / different hook": edit that entry in the matching `picks/*.json` (times or hook), delete the old mp4, re-run render (it re-picks deterministically, so the same top picks come back with the change).
 - "Give me 5 clips": `render <run> --top 5`.
-- Check one frame per clip after render. If the top panel shows the wrong face (the stream switches between
-  full-screen layouts mid-clip, or a face on screen gets mistaken for the facecam), add `"layout": "gameplay"`
-  (or `"cam"`) to that pick in `picks/*.json`, delete its mp4 and re-run render.
-- Disk: prep deletes the audio after transcribing and render deletes downloaded sections (`--keep` keeps
-  them). Runs live in `~/GTA6-Clips/` (or `$GTA6_CLIPS_DIR`); delete finished ones only if the user says so.
+- Check one frame per clip after render. If the top panel shows the wrong face (the stream switches between full-screen layouts mid-clip, or a face on screen gets mistaken for the facecam), add `"layout": "gameplay"` (or `"cam"`) to that pick in `picks/*.json`, delete its mp4 and re-run render.
+- Disk: prep deletes the audio after transcribing and render deletes downloaded sections (`--keep` keeps them). Runs live in `~/GTA6-Clips/` (or `$GTA6_CLIPS_DIR`); on Windows that is `%USERPROFILE%\GTA6-Clips`. Delete finished ones only if the user says so.
 
 ## Free mode (no subscription)
 
-Same skill, same prompts. The user installs Ollama, pulls a model sized to their MEMORY (Apple menu ->
-About This Mac -> Memory): 16 GB -> `qwen3.5:9b`, 32 GB+ -> `qwen3.5:27b`, then runs `ollama launch claude`
-and picks the model. Be honest if asked: it's slower and the picks are rougher than Claude's.
+Same skill, same prompts. The user installs Ollama, pulls a model sized to their memory (Mac: Apple menu -> About This Mac -> Memory. Windows: Settings -> System -> About -> Installed RAM): 16 GB -> `qwen3.5:9b`, 32 GB+ -> `qwen3.5:27b`, then runs `ollama launch claude` and picks the model. Be honest if asked: it's slower and the picks are rougher than Claude's.

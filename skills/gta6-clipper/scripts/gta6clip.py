@@ -1,27 +1,54 @@
 #!/usr/bin/env python3
 """GTA 6 Clipper: stream link (or nothing) -> ready-to-post vertical clips.
 
-  discover            find today's biggest GTA 6 streams (YouTube + Twitch)
+  discover            find GTA 6 YouTube videos, finished streams, and livestreams.
+                      No link needed. Twitch is included when .env has API keys.
   prep URL [URL...]   steps 1+2: audio-only download, local transcript, loud moments,
                       chat speed-ups (YouTube replays), 12-minute chunks for the AI to read
   status RUN          show what a run has and what's left
   render RUN          step 4: rank the AI's picks, download only those minutes,
                       find the facecam, stack facecam over gameplay, hook + word captions,
                       post caption + hashtags
+  open RUN            open the clips folder (Finder on Mac, Explorer on Windows)
 
 Step 3 (picking) is done by the Claude Code session itself (no API keys); see SKILL.md.
-Run with the skill's venv:  .venv/bin/python scripts/gta6clip.py <command>
+Mac:      bash scripts/gta6.sh <command>
+Windows:  powershell -NoProfile -ExecutionPolicy Bypass -File scripts/gta6.ps1 <command>
 """
 import argparse, concurrent.futures as cf, datetime as dt, json, math, os, re, shutil
-import statistics, subprocess, sys, time, urllib.request
+import signal, statistics, subprocess, sys, time, urllib.parse, urllib.request
 from pathlib import Path
+
+# Windows opens text as the ANSI code page and turns \n into \r\n. Transcripts,
+# chat and captions contain emoji, and ffmpeg concat lists want LF. Force both.
+_read_text = Path.read_text
+_write_text = Path.write_text
+
+
+def _read_text_utf8(self, encoding=None, errors=None):
+    return _read_text(self, encoding=encoding or "utf-8", errors=errors)
+
+
+def _write_text_utf8(self, data, encoding=None, errors=None, newline=None):
+    return _write_text(self, data, encoding=encoding or "utf-8", errors=errors,
+                       newline="\n" if newline is None else newline)
+
+
+Path.read_text = _read_text_utf8
+Path.write_text = _write_text_utf8
 
 SKILL = Path(__file__).resolve().parent.parent
 RUNS = Path(os.environ.get("GTA6_CLIPS_DIR", Path.home() / "GTA6-Clips"))
 CFG = json.loads((SKILL / "config.json").read_text()) if (SKILL / "config.json").exists() else {}
 CHUNK_SEC = 12 * 60
 YTDLP = [sys.executable, "-m", "yt_dlp", "--no-warnings", "--quiet", "--no-progress"]
-GTA_RE = re.compile(r"\bgta\s*(6|vi)\b|grand theft auto\s*(6|vi)\b", re.I)
+# "gta 6", "gta6", "gta-6", "gta vi", "gtavi", "gta six", "grand theft auto vi".
+# Does not match "gta64" or "gta vibe".
+GTA_RE = re.compile(
+    r"(?i)(?:\bgta[\s\-_]*?(?:6|vi|six)\b|\bgrand\s+theft\s+auto[\s\-_]*?(?:6|vi|six)\b)"
+)
+STREAMISH_RE = re.compile(r"(?i)\b(stream|vod|livestream|live\s*stream|playthrough|full\s+gameplay)\b")
+SHORTS_RE = re.compile(r"(?i)(#shorts\b|\byoutube shorts\b)")
 
 
 # ---------------------------------------------------------------- helpers
@@ -30,7 +57,127 @@ def log(*a):
 
 
 def run(cmd, **kw):
+    kw.setdefault("encoding", "utf-8")
+    kw.setdefault("errors", "replace")
+    if os.name == "nt":
+        # ffmpeg, whisper and yt-dlp are console programs. Don't flash a window each call.
+        kw.setdefault("creationflags", subprocess.CREATE_NO_WINDOW)
+        if kw.get("startupinfo") is None:
+            si = subprocess.STARTUPINFO()
+            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            si.wShowWindow = 0
+            kw["startupinfo"] = si
     return subprocess.run(cmd, capture_output=True, text=True, **kw)
+
+
+def popen(cmd, **kw):
+    if os.name == "nt":
+        kw.setdefault("creationflags", subprocess.CREATE_NO_WINDOW)
+    return subprocess.Popen(cmd, **kw)
+
+
+def spawn_background(cmd, stdout):
+    """Detached recorder. start_new_session does not exist on Windows."""
+    kw = {"stdout": stdout, "stderr": subprocess.STDOUT}
+    if os.name == "nt":
+        kw["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+    else:
+        kw["start_new_session"] = True
+    return subprocess.Popen(cmd, **kw)
+
+
+def pid_alive(pid):
+    try:
+        pid = int(str(pid).strip())
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+        k = ctypes.WinDLL("kernel32", use_last_error=True)
+        k.OpenProcess.argtypes = (ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32)
+        k.OpenProcess.restype = ctypes.c_void_p
+        k.CloseHandle.argtypes = (ctypes.c_void_p,)
+        k.CloseHandle.restype = ctypes.c_int
+        handle = k.OpenProcess(0x1000, 0, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return False
+        k.CloseHandle(handle)
+        return True
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def stop_process(pid):
+    """Ask the recorder to finish. On Windows, fall back to taskkill if the console signal fails."""
+    pid = int(pid)
+    if os.name == "nt":
+        try:
+            os.kill(pid, signal.CTRL_BREAK_EVENT)
+            return
+        except (OSError, ValueError, AttributeError):
+            pass
+        run(["taskkill", "/PID", str(pid), "/T", "/F"])
+        return
+    os.killpg(pid, signal.SIGTERM)
+
+
+def which_tool(names):
+    """ffmpeg / ffprobe / whisper-cli on PATH, or the copy setup.ps1 unpacked into bin/."""
+    if isinstance(names, str):
+        names = [names]
+    candidates = []
+    for name in names:
+        candidates.append(name)
+        if os.name == "nt" and not name.lower().endswith(".exe"):
+            candidates.append(name + ".exe")
+    for name in candidates:
+        found = shutil.which(name)
+        if found:
+            return found
+    bindir = SKILL / "bin"
+    for name in candidates:
+        cand = bindir / name
+        if cand.is_file():
+            return str(cand)
+    return candidates[0]
+
+
+def whisper_bin():
+    cfg = CFG.get("whisper_bin")
+    if cfg and Path(cfg).is_file():
+        return str(cfg)
+    return which_tool(["whisper-cli", "main"])
+
+
+def ffmpeg_concat_line(path):
+    """One ffconcat line. Forward slashes, so a Windows path survives the concat demuxer."""
+    s = Path(path).resolve().as_posix().replace("'", r"'\''")
+    return f"file '{s}'"
+
+
+def open_folder(path):
+    path = str(path)
+    try:
+        if os.name == "nt":
+            os.startfile(path)
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", path])
+        else:
+            subprocess.Popen(["xdg-open", path])
+    except Exception as e:
+        log(f"(could not open the folder automatically: {e})")
+    log(path)
+
+
+def setup_hint():
+    if os.name == "nt":
+        return r"Not set up yet. Run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts\setup.ps1"
+    return "Not set up yet. Run: bash scripts/setup.sh"
 
 
 def cookie_args(c):
@@ -59,14 +206,38 @@ def slug(s, n=40):
     return s[:n] or "stream"
 
 
-def ytdlp_json(url, cookies=None, extra=()):
-    r = run(YTDLP + cookie_args(cookies) + list(extra) + ["-J", url])
+def ytdlp_json(url, cookies=None, extra=(), timeout=180):
+    try:
+        r = run(YTDLP + cookie_args(cookies) + list(extra) + ["-J", url], timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("yt-dlp timed out")
     if r.returncode != 0:
-        raise RuntimeError(r.stderr.strip().splitlines()[-1] if r.stderr.strip() else "yt-dlp failed")
+        err = (r.stderr or "").strip().splitlines()
+        raise RuntimeError(err[-1] if err else "yt-dlp failed")
     return json.loads(r.stdout)
 
 
 # ---------------------------------------------------------------- discover
+# YouTube search needs no API key. sp=EgJAAQ== is YouTube's Live filter.
+VOD_SEARCHES = [
+    "ytsearch25:GTA 6 full stream",
+    "ytsearch20:GTA VI stream",
+    "ytsearch15:Grand Theft Auto VI gameplay stream",
+    "ytsearch15:GTA 6 funny stream",
+]
+VIDEO_SEARCHES = [
+    "ytsearch20:GTA 6 gameplay",
+    "ytsearch15:GTA VI reaction",
+    "ytsearch15:GTA 6 highlights",
+]
+LIVE_SEARCHES = [
+    "https://www.youtube.com/results?search_query=GTA+6&sp=EgJAAQ%3D%3D",
+    "https://www.youtube.com/results?search_query=GTA+VI&sp=EgJAAQ%3D%3D",
+    "https://www.youtube.com/results?search_query=Grand+Theft+Auto+VI&sp=EgJAAQ%3D%3D",
+    "https://www.youtube.com/results?search_query=GTA+6+livestream&sp=EgJAAQ%3D%3D",
+]
+
+
 def load_env():
     env = {}
     f = SKILL / ".env"
@@ -85,84 +256,289 @@ def helix(path, cid, token):
         return json.loads(r.read())
 
 
-def discover_twitch(limit):
+def discover_twitch(limit, warn=log):
     """Official Twitch API. Needs a free Twitch dev app (dev.twitch.tv/console):
     TWITCH_CLIENT_ID + TWITCH_CLIENT_SECRET in the skill's .env. Skipped without them."""
     env = load_env()
     cid, sec = env.get("TWITCH_CLIENT_ID"), env.get("TWITCH_CLIENT_SECRET")
     if not (cid and sec):
-        log("  twitch: skipped (add TWITCH_CLIENT_ID / TWITCH_CLIENT_SECRET to .env to include Twitch)")
+        warn("  twitch: skipped (add TWITCH_CLIENT_ID / TWITCH_CLIENT_SECRET to .env to include Twitch)")
         return []
     out = []
     try:
         body = f"client_id={cid}&client_secret={sec}&grant_type=client_credentials".encode()
         with urllib.request.urlopen(urllib.request.Request("https://id.twitch.tv/oauth2/token", data=body), timeout=20) as r:
             tok = json.loads(r.read())["access_token"]
-        games = helix("games?name=Grand%20Theft%20Auto%20VI", cid, tok).get("data") or []
+        games = []
+        for name in ("Grand Theft Auto VI", "Grand Theft Auto 6"):
+            games = helix(f"games?name={urllib.parse.quote(name)}", cid, tok).get("data") or []
+            if games:
+                break
         streams = helix(f"streams?game_id={games[0]['id']}&first=20", cid, tok).get("data", []) if games else []
         for st in streams[: limit * 2]:
             vids = helix(f"videos?user_id={st['user_id']}&type=archive&first=1", cid, tok).get("data") or []
-            if vids:
-                out.append({"platform": "twitch", "streamer": st["user_name"], "title": st["title"],
-                            "viewers": st["viewer_count"], "live_now": True, "url": vids[0]["url"]})
+            login = st.get("user_login") or st["user_name"]
+            live_url = f"https://www.twitch.tv/{login}"
+            archive = vids[0]["url"] if vids else None
+            out.append({"platform": "twitch", "kind": "live", "id": st.get("id"),
+                        "streamer": st["user_name"], "title": st["title"],
+                        "viewers": st["viewer_count"], "live_now": True, "duration": 0, "length": "LIVE",
+                        "url": archive or live_url, "live_url": live_url})
     except Exception as e:
-        log(f"  twitch: skipped ({e})")
+        warn(f"  twitch: skipped ({e})")
     return out
 
 
-def discover_youtube(limit):
-    """Finished GTA 6 streams from today / this week (clippable now) + what's live right now."""
-    out, seen = [], set()
-    searches = [("GTA+6+stream", "EgIIAg%3D%3D"), ("GTA+6+live", "EgIIAg%3D%3D"),
-                ("GTA+6+stream", "EgIIAw%3D%3D"), ("GTA+6", "EgJAAQ%3D%3D")]
-    for q, sp in searches:
+def video_id(entry):
+    vid = str((entry or {}).get("id") or "")
+    if re.fullmatch(r"[\w-]{11}", vid):
+        return vid
+    m = re.search(r"(?:v=|youtu\.be/)([\w-]{11})", (entry or {}).get("url") or "")
+    return m.group(1) if m else None
+
+
+def classify_youtube(entry):
+    """One yt-dlp entry -> a discover row, or None when it is not worth clipping."""
+    if not entry:
+        return None
+    vid = video_id(entry)
+    title = (entry.get("title") or "").strip()
+    if not vid or not title or not GTA_RE.search(title):
+        return None
+    if SHORTS_RE.search(title):
+        return None
+    live_status = entry.get("live_status") or ""
+    if live_status == "is_upcoming":
+        return None
+    try:
+        duration = float(entry.get("duration") or 0)
+    except (TypeError, ValueError):
+        duration = 0.0
+    is_live = live_status in ("is_live", "live") or entry.get("is_live") is True
+    # A Live-tab hit we could not fully read still gets a chance. start says NOT LIVE if it ended.
+    if not is_live and entry.get("_source") == "live" and not live_status and not duration:
+        is_live = True
+    if is_live:
         try:
-            pl = ytdlp_json(f"https://www.youtube.com/results?search_query={q}&sp={sp}",
-                            extra=["--flat-playlist", "--playlist-end", "40"])
-        except Exception as e:
-            log(f"  youtube search skipped: {e}")
+            viewers = int(entry.get("concurrent_view_count") or 0)
+        except (TypeError, ValueError):
+            viewers = 0
+        kind = "live"
+    else:
+        try:
+            viewers = int(entry.get("view_count") or 0)
+        except (TypeError, ValueError):
+            viewers = 0
+        if duration and duration < 8 * 60:
+            return None
+        if duration >= 20 * 60 or (STREAMISH_RE.search(title) and (duration == 0 or duration >= 8 * 60)):
+            kind = "stream"
+        elif duration >= 8 * 60:
+            kind = "video"
+        else:
+            return None
+    url = entry.get("webpage_url") or ""
+    if "youtube.com/watch" not in url and "youtu.be/" not in url:
+        url = f"https://www.youtube.com/watch?v={vid}"
+    row = {"platform": "youtube", "kind": kind, "id": vid,
+           "streamer": entry.get("channel") or entry.get("uploader") or entry.get("creator") or "",
+           "title": title, "live_now": is_live, "viewers": viewers, "duration": duration,
+           "length": "LIVE" if is_live else (hms(duration) if duration else "?"), "url": url}
+    if is_live:
+        row["live_url"] = url
+    return row
+
+
+def _flat_search(url, warn):
+    try:
+        pl = ytdlp_json(url, extra=["--flat-playlist", "--playlist-end", "30"])
+    except Exception as e:
+        warn(f"  youtube search skipped: {e}")
+        return []
+    return [e for e in (pl.get("entries") or []) if e]
+
+
+def _enrich_video(vid):
+    try:
+        return ytdlp_json(f"https://www.youtube.com/watch?v={vid}",
+                          extra=["--no-playlist", "--skip-download"])
+    except Exception:
+        return None
+
+
+def _needs_enrich(entry):
+    if not entry.get("duration"):
+        return True
+    if entry.get("_source") == "live" and not entry.get("live_status"):
+        return True
+    return False
+
+
+def discover_youtube(limit, include_videos=True, live_only=False, warn=log):
+    """YouTube videos, finished streams, and livestreams. No API key."""
+    if live_only:
+        searches = [(u, "live") for u in LIVE_SEARCHES]
+    else:
+        searches = [(u, "stream") for u in VOD_SEARCHES]
+        if include_videos:
+            searches += [(u, "video") for u in VIDEO_SEARCHES]
+        searches += [(u, "live") for u in LIVE_SEARCHES]
+    found = []
+    workers = min(4, len(searches))
+    with cf.ThreadPoolExecutor(workers) as ex:
+        batches = ex.map(lambda item: (_flat_search(item[0], warn), item[1]), searches)
+        for batch, source in batches:
+            for entry in batch:
+                entry = dict(entry)
+                entry["_source"] = source
+                found.append(entry)
+    by_id = {}
+    for entry in found:
+        vid = video_id(entry)
+        if not vid or not GTA_RE.search(entry.get("title") or ""):
             continue
-        for e in pl.get("entries") or []:
-            if not e or e.get("id") in seen or not GTA_RE.search(e.get("title") or ""):
-                continue
-            live = e.get("live_status") == "is_live"
-            if not live and (e.get("duration") or 0) < 40 * 60:  # regular videos aren't streams
-                continue
-            seen.add(e["id"])
-            out.append({"platform": "youtube", "streamer": e.get("channel") or e.get("uploader") or "",
-                        "title": e.get("title", ""), "live_now": live,
-                        "viewers": (e.get("concurrent_view_count") or 0) * 20 if live else (e.get("view_count") or 0),
-                        "length": hms(e.get("duration") or 0), "url": f"https://www.youtube.com/watch?v={e['id']}"})
+        if vid in by_id:
+            # The same upload can show up in a normal search and on the Live tab.
+            # Keep the Live tab hint so we confirm it instead of treating it as a recording.
+            if source == "live" and not by_id[vid].get("live_status"):
+                by_id[vid]["_source"] = "live"
+            continue
+        by_id[vid] = entry
+    need = [vid for vid, entry in by_id.items() if _needs_enrich(entry)][:16]
+    if need:
+        with cf.ThreadPoolExecutor(4) as ex:
+            for vid, meta in zip(need, ex.map(_enrich_video, need)):
+                if not meta:
+                    continue
+                meta = dict(meta)
+                meta["_source"] = by_id[vid].get("_source")
+                by_id[vid] = meta
+    out = []
+    for entry in by_id.values():
+        row = classify_youtube(entry)
+        if row:
+            out.append(row)
     return out
+
+
+def discover_streams(limit=7, live_only=False, include_videos=True, warn=log):
+    """Biggest GTA 6 livestreams, finished streams, and YouTube videos. No links required."""
+    limit = max(1, int(limit))
+    with cf.ThreadPoolExecutor(2) as ex:
+        tw = ex.submit(discover_twitch, limit, warn)
+        yt = ex.submit(discover_youtube, limit, include_videos, live_only, warn)
+        streams = tw.result() + yt.result()
+    if live_only:
+        streams = [s for s in streams if s.get("live_now") or s.get("kind") == "live"]
+    elif not include_videos:
+        streams = [s for s in streams if s.get("kind") != "video"]
+    order = {"live": 0, "stream": 1, "video": 2}
+    streams.sort(key=lambda s: (order.get(s.get("kind"), 9), -(s.get("viewers") or 0)))
+    seen_id, seen_who = set(), set()
+    ranked = []
+    for s in streams:
+        ident = s.get("id") or s.get("url")
+        who = ((s.get("streamer") or "").strip().lower(), s.get("kind"))
+        if ident in seen_id:
+            continue
+        if who[0] and who in seen_who:
+            continue
+        seen_id.add(ident)
+        if who[0]:
+            seen_who.add(who)
+        ranked.append(s)
+    if live_only:
+        return ranked[:limit]
+    # Leave room for finished videos when a lot of people are live.
+    buckets = {"live": [], "stream": [], "video": []}
+    for s in ranked:
+        buckets.setdefault(s.get("kind") or "video", []).append(s)
+    live_cap = max(1, limit // 2)
+    picked = list(buckets.get("live", [])[:live_cap])
+    for kind in ("stream", "video"):
+        for s in buckets.get(kind, []):
+            if len(picked) >= limit:
+                break
+            picked.append(s)
+    if len(picked) < limit:
+        have = {s.get("id") or s.get("url") for s in picked}
+        for s in buckets.get("live", []):
+            ident = s.get("id") or s.get("url")
+            if ident in have:
+                continue
+            picked.append(s)
+            if len(picked) >= limit:
+                break
+    return picked[:limit]
+
+
+def _emit_discover(picked):
+    groups = [("LIVE NOW", "live"), ("FINISHED STREAMS", "stream"), ("YOUTUBE VIDEOS", "video")]
+    n = 0
+    for label, kind in groups:
+        rows = [s for s in picked if s.get("kind") == kind]
+        if not rows:
+            continue
+        log(f"\n{label}")
+        for s in rows:
+            n += 1
+            who = s.get("streamer") or "unknown"
+            if s.get("live_now"):
+                extra = f"{s.get('viewers', 0):,} watching"
+            else:
+                extra = f"{s.get('length', '?')}, {s.get('viewers', 0):,} views"
+            log(f"{n}. [{s['platform']}] {who} ({extra}) {s['title'][:80]}")
+            if s.get("kind") == "live":
+                log(f"   live: {s.get('live_url') or s['url']}")
+                if s.get("url") and s.get("live_url") and s["url"] != s["live_url"]:
+                    log(f"   replay (finished-stream clipper can use this while it is live): {s['url']}")
+            else:
+                log(f"   {s['url']}")
+    prep = [s["url"] for s in picked if s.get("kind") != "live"]
+    live = [s.get("live_url") or s["url"] for s in picked if s.get("kind") == "live"]
+    if prep:
+        log("\nPREP THESE:")
+        for u in prep:
+            log(u)
+    if live:
+        log("\nLIVE THESE:")
+        for u in live:
+            log(u)
+    log("\nNo link needed. Prep PREP THESE. Pass LIVE THESE to the live clipper, or run it with no link.")
 
 
 def cmd_discover(a):
-    log("Finding today's biggest GTA 6 streams...")
-    with cf.ThreadPoolExecutor(2) as ex:
-        tw, yt = ex.submit(discover_twitch, a.limit), ex.submit(discover_youtube, a.limit)
-        streams = tw.result() + yt.result()
-    # clippable first (finished YouTube replays + Twitch archives), YouTube still-live last
-    streams.sort(key=lambda s: (s["platform"] == "youtube" and s["live_now"], -s["viewers"]))
-    seen, picked = set(), []
-    for s in streams:
-        k = s["streamer"].lower()
-        if k not in seen:
-            seen.add(k)
-            picked.append(s)
-    picked = picked[: a.limit]
+    quiet = bool(getattr(a, "json", False))
+    warnings = []
+
+    def warn(msg):
+        if quiet:
+            warnings.append(str(msg))
+        else:
+            log(msg)
+
+    if not quiet:
+        log("Finding GTA 6 videos and livestreams. No link needed...")
+    live_only = bool(getattr(a, "live", False))
+    include_videos = not bool(getattr(a, "streams_only", False))
+    picked = discover_streams(a.limit, live_only=live_only, include_videos=include_videos, warn=warn)
     RUNS.mkdir(parents=True, exist_ok=True)
     (RUNS / f"discover-{dt.date.today()}.json").write_text(json.dumps(picked, indent=2))
-    for i, s in enumerate(picked, 1):
-        tag = "LIVE NOW, clip after it ends" if s["platform"] == "youtube" and s["live_now"] else s.get("length", "archive")
-        log(f"{i}. [{s['platform']}] {s['streamer']} ({tag}) {s['title'][:80]}\n   {s['url']}")
+    if quiet:
+        for w in warnings:
+            print(w, file=sys.stderr)
+        print(json.dumps(picked, indent=2), flush=True)
+        return
     if not picked:
-        log("Nothing found. Paste stream links instead.")
+        log("Nothing found on YouTube right now. Try again in a few minutes. A link still works if you already have one.")
+        return
+    _emit_discover(picked)
 
 
 # ---------------------------------------------------------------- prep (steps 1 + 2)
 def loud_moments(wav):
     """Per-second RMS, flag seconds well above the local baseline (yelling / losing it)."""
-    r = run(["ffmpeg", "-hide_banner", "-nostats", "-i", str(wav), "-af",
+    r = run([which_tool("ffmpeg"), "-hide_banner", "-nostats", "-i", str(wav), "-af",
              "asetnsamples=n=16000,astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.RMS_level:file=-",
              "-f", "null", "-"])
     vals = []
@@ -196,7 +572,7 @@ def chat_spikes(chat_file):
     if not chat_file or not Path(chat_file).exists():
         return []
     times = []
-    with open(chat_file) as f:
+    with open(chat_file, encoding="utf-8", errors="replace") as f:
         for line in f:
             try:
                 ms = json.loads(line)["replayChatItemAction"]["videoOffsetTimeMsec"]
@@ -221,7 +597,7 @@ def chat_spikes(chat_file):
 
 def transcribe(wav, out_base, words=False):
     model = CFG.get("whisper_model") or os.path.expanduser("~/.cache/whisper-cpp/ggml-small.bin")
-    cmd = ["whisper-cli", "-m", model, "-f", str(wav), "-l", "en", "-np", "-mc", "0", "-oj", "-of", str(out_base)]
+    cmd = [whisper_bin(), "-m", model, "-f", str(wav), "-l", "en", "-np", "-mc", "0", "-oj", "-of", str(out_base)]
     if words:
         cmd += ["-ml", "1", "-sow", "-ojf"]
     r = run(cmd)
@@ -268,11 +644,11 @@ def prep_one(url, cookies, force=False):
     if not src:
         raise RuntimeError(f"audio download failed: {ra.stderr[-300:]}")
     wav = rd / "audio.wav"
-    run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(src), "-ac", "1", "-ar", "16000", str(wav)])
+    run([which_tool("ffmpeg"), "-y", "-loglevel", "error", "-i", str(src), "-ac", "1", "-ar", "16000", str(wav)])
     src.unlink(missing_ok=True)
     t_dl = time.time()
 
-    log(f"[{streamer}] 2/2 transcribing on this Mac + scanning for loud moments and chat spikes")
+    log(f"[{streamer}] 2/2 transcribing on this computer + scanning for loud moments and chat spikes")
     with cf.ThreadPoolExecutor(2) as ex:
         fs = ex.submit(transcribe, wav, rd / "whisper")
         fl = ex.submit(loud_moments, wav)
@@ -458,8 +834,20 @@ def find_facecam(video, W, H):
 
 def font(size):
     from PIL import ImageFont
-    for f in ("/System/Library/Fonts/Supplemental/Arial Black.ttf", "/System/Library/Fonts/Supplemental/Impact.ttf"):
-        if Path(f).exists():
+    windir = os.environ.get("WINDIR", r"C:\Windows")
+    candidates = [
+        "/System/Library/Fonts/Supplemental/Arial Black.ttf",
+        "/System/Library/Fonts/Supplemental/Impact.ttf",
+        "/Library/Fonts/Arial Black.ttf",
+        str(Path(windir) / "Fonts" / "ariblk.ttf"),
+        str(Path(windir) / "Fonts" / "impact.ttf"),
+        str(Path(windir) / "Fonts" / "arialbd.ttf"),
+        "/usr/share/fonts/truetype/msttcorefonts/Arial_Black.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    ]
+    for f in candidates:
+        if f and Path(f).exists():
             return ImageFont.truetype(f, size)
     return ImageFont.load_default()
 
@@ -553,7 +941,7 @@ def caption_frames(words, hook, seam_y, cap_y, dur, outdir):
 
 def clip_words(src, ss, dur, work):
     wav = work / "w.wav"
-    run(["ffmpeg", "-y", "-loglevel", "error", "-ss", f"{ss:.2f}", "-t", f"{dur:.2f}", "-i", str(src),
+    run([which_tool("ffmpeg"), "-y", "-loglevel", "error", "-ss", f"{ss:.2f}", "-t", f"{dur:.2f}", "-i", str(src),
          "-ac", "1", "-ar", "16000", str(wav)])
     segs = transcribe(wav, work / "words", words=True)
     words = []
@@ -588,7 +976,7 @@ def render_one(rd, info, c, n, cookies, keep, local_src=None, src_start=None):
         src = next((p for p in work.glob("src.*") if p.suffix in (".mp4", ".mkv", ".webm")), None)
         if not src:
             raise RuntimeError("section download failed: " + r.stderr[-300:])
-    pr = json.loads(run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+    pr = json.loads(run([which_tool("ffprobe"), "-v", "error", "-select_streams", "v:0", "-show_entries",
                          "stream=width,height:format=duration", "-of", "json", str(src)]).stdout)
     W, H = pr["streams"][0]["width"], pr["streams"][0]["height"]
     sdur = float(pr["format"]["duration"])
@@ -627,7 +1015,7 @@ def render_one(rd, info, c, n, cookies, keep, local_src=None, src_start=None):
         seam, cap_y = 560, 1420
     lst = caption_frames(words, c.get("hook") or c.get("title"), seam, cap_y, dur, work / "cap")
     out = clips / f"clip_{n:02d}_{slug(c.get('title') or c.get('hook'), 40)}.mp4"
-    r = run(["ffmpeg", "-y", "-loglevel", "error", "-ss", f"{ss:.3f}", "-t", f"{dur:.3f}", "-i", str(src),
+    r = run([which_tool("ffmpeg"), "-y", "-loglevel", "error", "-ss", f"{ss:.3f}", "-t", f"{dur:.3f}", "-i", str(src),
              "-f", "concat", "-safe", "0", "-i", str(lst), "-filter_complex",
              vf + ";[1:v]format=rgba[ov];[base][ov]overlay=0:0:eof_action=repeat:format=auto,format=yuv420p[v];"
              "[0:a]loudnorm=I=-14:TP=-1.5:LRA=11,aresample=48000[aout]",
@@ -641,9 +1029,12 @@ def render_one(rd, info, c, n, cookies, keep, local_src=None, src_start=None):
             f"Category: {c.get('category')}  Score: {c.get('score')}  Layout: {fc['mode']}\n")
     out.with_suffix(".txt").write_text(post)
     if not keep:
-        shutil.rmtree(work, ignore_errors=True)
         if local_src is not None:
-            Path(local_src).unlink(missing_ok=True)
+            try:
+                Path(local_src).unlink(missing_ok=True)
+            except OSError:
+                pass
+        shutil.rmtree(work, ignore_errors=True)
     return out, fc["mode"]
 
 
@@ -673,23 +1064,37 @@ def cmd_render(a):
         f"(total {summary['total_time']}) -> {rd / 'clips'}")
 
 
+def cmd_open(a):
+    rd = Path(a.run)
+    folder = rd / "clips" if (rd / "clips").exists() else rd
+    if not folder.exists():
+        log(f"No folder yet: {folder}")
+        return
+    open_folder(folder)
+
+
 # ---------------------------------------------------------------- main
 def main():
     if not (SKILL / ".ready").exists():
-        sys.exit("Not set up yet. Run: bash scripts/setup.sh")
+        sys.exit(setup_hint())
     p = argparse.ArgumentParser()
     sp = p.add_subparsers(dest="cmd", required=True)
-    d = sp.add_parser("discover"); d.add_argument("--limit", type=int, default=7)
+    d = sp.add_parser("discover")
+    d.add_argument("--limit", type=int, default=7)
+    d.add_argument("--live", action="store_true", help="only livestreams")
+    d.add_argument("--streams-only", action="store_true", help="skip regular YouTube videos")
+    d.add_argument("--json", action="store_true", help="print JSON only")
     pr = sp.add_parser("prep"); pr.add_argument("urls", nargs="+")
-    pr.add_argument("--cookies", help="chrome / safari / firefox, or a cookies.txt path (age-restricted YouTube, Kick)")
-    pr.add_argument("--jobs", type=int, default=2, help="streams processed at once (2 is safe on a 16 GB Mac)")
+    pr.add_argument("--cookies", help="chrome / edge / firefox / brave, or a cookies.txt path. safari is Mac only")
+    pr.add_argument("--jobs", type=int, default=2, help="streams processed at once (2 is comfortable on 16 GB)")
     pr.add_argument("--force", action="store_true")
     s = sp.add_parser("status"); s.add_argument("run")
     r = sp.add_parser("render"); r.add_argument("run")
     r.add_argument("--top", type=int, default=3); r.add_argument("--min-score", type=float, default=7.0)
     r.add_argument("--cookies"); r.add_argument("--keep", action="store_true", help="keep downloaded source sections")
+    o = sp.add_parser("open"); o.add_argument("run")
     a = p.parse_args()
-    {"discover": cmd_discover, "prep": cmd_prep, "status": cmd_status, "render": cmd_render}[a.cmd](a)
+    {"discover": cmd_discover, "prep": cmd_prep, "status": cmd_status, "render": cmd_render, "open": cmd_open}[a.cmd](a)
 
 
 if __name__ == "__main__":
