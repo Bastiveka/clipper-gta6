@@ -7,7 +7,7 @@ Here are both GTA 6 clipper skills from the video. Free. Mac and Windows. You do
 **1. Open Claude Code and paste this:**
 
 ```text
-Install the GTA 6 Clipper skills from this repository.
+Install the GTA 6 Clipper skills from https://github.com/Bastiveka/clipper-gta6.
 Clone the repo to a temporary folder, then copy BOTH folders inside its skills/ folder
 (gta6-clipper and gta6-live-clipper) into the Claude skills folder so they sit side by side.
 - Mac: ~/.claude/skills/

@@ -3,8 +3,8 @@
   "version": "1.1.0",
   "description": "Turn GTA 6 YouTube videos and streams into ready-to-post vertical clips. Two skills: clip a finished video, or clip a livestream while it is live. With no link, it finds the YouTube videos and livestreams itself. Facecam on top, gameplay below, hook title, word-by-word captions, post caption and hashtags. Mac and Windows.",
   "author": { "name": "Ashton Voss AI" },
-  "homepage": "https://github.com/vossashtonai/gta6-clipper",
-  "repository": "https://github.com/vossashtonai/gta6-clipper",
+  "homepage": "https://github.com/Bastiveka/clipper-gta6",
+  "repository": "https://github.com/Bastiveka/clipper-gta6",
   "license": "MIT",
   "keywords": ["gta6", "clipping", "twitch", "youtube", "kick", "shorts", "video"]
 }

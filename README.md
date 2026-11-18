@@ -16,7 +16,7 @@ You do not need a YouTube API key. Twitch in the search is optional (see below).
 ### Option A: paste this into Claude Code (easiest)
 
 ```text
-Install the GTA 6 Clipper skills from this repository.
+Install the GTA 6 Clipper skills from https://github.com/Bastiveka/clipper-gta6.
 Clone the repo to a temporary folder, then copy BOTH folders inside its skills/ folder
 (gta6-clipper and gta6-live-clipper) into the Claude skills folder so they sit side by side.
 - Mac: ~/.claude/skills/
@@ -32,7 +32,7 @@ Tell me what it installed and whether it says READY. Then remind me to restart C
 In Claude Code, add the marketplace for the GitHub repository you cloned (the original Mac-only release is `vossashtonai/gta6-clipper`; this copy is the Mac and Windows one):
 
 ```text
-/plugin marketplace add <owner/repo>
+/plugin marketplace add Bastiveka/clipper-gta6
 /plugin install gta6-clipper@ashtonvossai
 ```
 
@@ -43,7 +43,7 @@ Then say **set up the GTA 6 clipper**. On Windows, setup runs `scripts/setup.ps1
 Mac:
 
 ```bash
-git clone <this repository> /tmp/gta6-clipper
+git clone https://github.com/Bastiveka/clipper-gta6.git /tmp/gta6-clipper
 cp -R /tmp/gta6-clipper/skills/gta6-clipper /tmp/gta6-clipper/skills/gta6-live-clipper ~/.claude/skills/
 bash ~/.claude/skills/gta6-clipper/scripts/setup.sh
 ```
@@ -51,7 +51,7 @@ bash ~/.claude/skills/gta6-clipper/scripts/setup.sh
 Windows (PowerShell):
 
 ```powershell
-git clone <this repository> $env:TEMP\gta6-clipper
+git clone https://github.com/Bastiveka/clipper-gta6.git $env:TEMP\gta6-clipper
 New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\.claude\skills" | Out-Null
 Copy-Item -Recurse -Force $env:TEMP\gta6-clipper\skills\gta6-clipper, $env:TEMP\gta6-clipper\skills\gta6-live-clipper "$env:USERPROFILE\.claude\skills\"
 powershell -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\.claude\skills\gta6-clipper\scripts\setup.ps1"
